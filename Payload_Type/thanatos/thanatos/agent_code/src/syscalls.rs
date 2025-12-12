@@ -385,7 +385,7 @@ macro_rules! syscall {
 // Wrapper functions for common NT operations
 // ============================================================================
 
-/// Allocate virtual memory using direct syscall
+/// Allocate virtual memory using indirect syscall
 pub unsafe fn nt_allocate_virtual_memory(
     process_handle: HANDLE,
     base_address: *mut PVOID,
@@ -394,19 +394,20 @@ pub unsafe fn nt_allocate_virtual_memory(
     allocation_type: ULONG,
     protect: ULONG,
 ) -> NTSTATUS {
-    let table = SYSCALL_TABLE.as_ref().expect("Syscalls not initialized");
-    indirect_syscall!(
-        table.nt_allocate_virtual_memory,
-        process_handle,
-        base_address,
-        zero_bits,
-        region_size,
-        allocation_type,
-        protect
+    sw3_syscall(
+        hashes::NT_ALLOCATE_VIRTUAL_MEMORY,
+        &[
+            process_handle as usize,
+            base_address as usize,
+            zero_bits,
+            region_size as usize,
+            allocation_type as usize,
+            protect as usize,
+        ],
     )
 }
 
-/// Protect virtual memory using direct syscall
+/// Protect virtual memory using indirect syscall
 pub unsafe fn nt_protect_virtual_memory(
     process_handle: HANDLE,
     base_address: *mut PVOID,
@@ -414,18 +415,19 @@ pub unsafe fn nt_protect_virtual_memory(
     new_protect: ULONG,
     old_protect: *mut ULONG,
 ) -> NTSTATUS {
-    let table = SYSCALL_TABLE.as_ref().expect("Syscalls not initialized");
-    indirect_syscall!(
-        table.nt_protect_virtual_memory,
-        process_handle,
-        base_address,
-        region_size,
-        new_protect,
-        old_protect
+    sw3_syscall(
+        hashes::NT_PROTECT_VIRTUAL_MEMORY,
+        &[
+            process_handle as usize,
+            base_address as usize,
+            region_size as usize,
+            new_protect as usize,
+            old_protect as usize,
+        ],
     )
 }
 
-/// Write to virtual memory using direct syscall
+/// Write to virtual memory using indirect syscall
 pub unsafe fn nt_write_virtual_memory(
     process_handle: HANDLE,
     base_address: PVOID,
@@ -433,18 +435,19 @@ pub unsafe fn nt_write_virtual_memory(
     size: usize,
     bytes_written: *mut usize,
 ) -> NTSTATUS {
-    let table = SYSCALL_TABLE.as_ref().expect("Syscalls not initialized");
-    indirect_syscall!(
-        table.nt_write_virtual_memory,
-        process_handle,
-        base_address,
-        buffer,
-        size,
-        bytes_written
+    sw3_syscall(
+        hashes::NT_WRITE_VIRTUAL_MEMORY,
+        &[
+            process_handle as usize,
+            base_address as usize,
+            buffer as usize,
+            size,
+            bytes_written as usize,
+        ],
     )
 }
 
-/// Read from virtual memory using direct syscall
+/// Read from virtual memory using indirect syscall
 pub unsafe fn nt_read_virtual_memory(
     process_handle: HANDLE,
     base_address: PVOID,
@@ -452,30 +455,46 @@ pub unsafe fn nt_read_virtual_memory(
     size: usize,
     bytes_read: *mut usize,
 ) -> NTSTATUS {
-    let table = SYSCALL_TABLE.as_ref().expect("Syscalls not initialized");
-    indirect_syscall!(
-        table.nt_read_virtual_memory,
-        process_handle,
-        base_address,
-        buffer,
-        size,
-        bytes_read
+    sw3_syscall(
+        hashes::NT_READ_VIRTUAL_MEMORY,
+        &[
+            process_handle as usize,
+            base_address as usize,
+            buffer as usize,
+            size,
+            bytes_read as usize,
+        ],
     )
 }
 
-/// Close handle using direct syscall
-pub unsafe fn nt_close(handle: HANDLE) -> NTSTATUS {
-    let table = SYSCALL_TABLE.as_ref().expect("Syscalls not initialized");
-    indirect_syscall!(table.nt_close, handle)
+/// Free virtual memory using indirect syscall
+pub unsafe fn nt_free_virtual_memory(
+    process_handle: HANDLE,
+    base_address: *mut PVOID,
+    region_size: *mut usize,
+    free_type: ULONG,
+) -> NTSTATUS {
+    sw3_syscall(
+        hashes::NT_FREE_VIRTUAL_MEMORY,
+        &[
+            process_handle as usize,
+            base_address as usize,
+            region_size as usize,
+            free_type as usize,
+        ],
+    )
 }
 
-/// Delay execution (sleep) using direct syscall
+/// Close handle using indirect syscall
+pub unsafe fn nt_close(handle: HANDLE) -> NTSTATUS {
+    sw3_syscall(hashes::NT_CLOSE, &[handle as usize])
+}
+
+/// Delay execution (sleep) using indirect syscall
 pub unsafe fn nt_delay_execution(alertable: bool, delay_interval: *mut i64) -> NTSTATUS {
-    let table = SYSCALL_TABLE.as_ref().expect("Syscalls not initialized");
-    indirect_syscall!(
-        table.nt_delay_execution,
-        alertable as usize,
-        delay_interval
+    sw3_syscall(
+        hashes::NT_DELAY_EXECUTION,
+        &[alertable as usize, delay_interval as usize],
     )
 }
 
@@ -488,17 +507,214 @@ pub fn syscall_sleep(milliseconds: u32) {
     }
 }
 
+// ============================================================================
+// Thread manipulation syscalls
+// ============================================================================
+
+/// Create a new thread using indirect syscall (NtCreateThreadEx)
+pub unsafe fn nt_create_thread_ex(
+    thread_handle: *mut HANDLE,
+    desired_access: ACCESS_MASK,
+    object_attributes: *mut OBJECT_ATTRIBUTES,
+    process_handle: HANDLE,
+    start_routine: PVOID,
+    argument: PVOID,
+    create_flags: ULONG,
+    zero_bits: usize,
+    stack_size: usize,
+    maximum_stack_size: usize,
+    attribute_list: PVOID,
+) -> NTSTATUS {
+    sw3_syscall(
+        hashes::NT_CREATE_THREAD_EX,
+        &[
+            thread_handle as usize,
+            desired_access as usize,
+            object_attributes as usize,
+            process_handle as usize,
+            start_routine as usize,
+            argument as usize,
+            create_flags as usize,
+            zero_bits,
+            stack_size,
+            maximum_stack_size,
+            attribute_list as usize,
+        ],
+    )
+}
+
+/// Resume a suspended thread
+pub unsafe fn nt_resume_thread(
+    thread_handle: HANDLE,
+    previous_suspend_count: *mut ULONG,
+) -> NTSTATUS {
+    sw3_syscall(
+        hashes::NT_RESUME_THREAD,
+        &[thread_handle as usize, previous_suspend_count as usize],
+    )
+}
+
+/// Suspend a thread
+pub unsafe fn nt_suspend_thread(
+    thread_handle: HANDLE,
+    previous_suspend_count: *mut ULONG,
+) -> NTSTATUS {
+    sw3_syscall(
+        hashes::NT_SUSPEND_THREAD,
+        &[thread_handle as usize, previous_suspend_count as usize],
+    )
+}
+
+/// Queue an APC to a thread
+pub unsafe fn nt_queue_apc_thread(
+    thread_handle: HANDLE,
+    apc_routine: PVOID,
+    apc_argument1: PVOID,
+    apc_argument2: PVOID,
+    apc_argument3: PVOID,
+) -> NTSTATUS {
+    sw3_syscall(
+        hashes::NT_QUEUE_APC_THREAD,
+        &[
+            thread_handle as usize,
+            apc_routine as usize,
+            apc_argument1 as usize,
+            apc_argument2 as usize,
+            apc_argument3 as usize,
+        ],
+    )
+}
+
+// ============================================================================
+// Process manipulation syscalls
+// ============================================================================
+
+/// Open a process handle
+pub unsafe fn nt_open_process(
+    process_handle: *mut HANDLE,
+    desired_access: ACCESS_MASK,
+    object_attributes: *mut OBJECT_ATTRIBUTES,
+    client_id: PVOID, // PCLIENT_ID
+) -> NTSTATUS {
+    sw3_syscall(
+        hashes::NT_OPEN_PROCESS,
+        &[
+            process_handle as usize,
+            desired_access as usize,
+            object_attributes as usize,
+            client_id as usize,
+        ],
+    )
+}
+
+// ============================================================================
+// Section/mapping syscalls (for reflective loading)
+// ============================================================================
+
+/// Create a section object
+pub unsafe fn nt_create_section(
+    section_handle: *mut HANDLE,
+    desired_access: ACCESS_MASK,
+    object_attributes: *mut OBJECT_ATTRIBUTES,
+    maximum_size: PLARGE_INTEGER,
+    section_page_protection: ULONG,
+    allocation_attributes: ULONG,
+    file_handle: HANDLE,
+) -> NTSTATUS {
+    sw3_syscall(
+        hashes::NT_CREATE_SECTION,
+        &[
+            section_handle as usize,
+            desired_access as usize,
+            object_attributes as usize,
+            maximum_size as usize,
+            section_page_protection as usize,
+            allocation_attributes as usize,
+            file_handle as usize,
+        ],
+    )
+}
+
+/// Map a view of a section into process address space
+pub unsafe fn nt_map_view_of_section(
+    section_handle: HANDLE,
+    process_handle: HANDLE,
+    base_address: *mut PVOID,
+    zero_bits: usize,
+    commit_size: usize,
+    section_offset: PLARGE_INTEGER,
+    view_size: *mut usize,
+    inherit_disposition: u32,
+    allocation_type: ULONG,
+    win32_protect: ULONG,
+) -> NTSTATUS {
+    sw3_syscall(
+        hashes::NT_MAP_VIEW_OF_SECTION,
+        &[
+            section_handle as usize,
+            process_handle as usize,
+            base_address as usize,
+            zero_bits,
+            commit_size,
+            section_offset as usize,
+            view_size as usize,
+            inherit_disposition as usize,
+            allocation_type as usize,
+            win32_protect as usize,
+        ],
+    )
+}
+
+/// Unmap a view of a section
+pub unsafe fn nt_unmap_view_of_section(
+    process_handle: HANDLE,
+    base_address: PVOID,
+) -> NTSTATUS {
+    sw3_syscall(
+        hashes::NT_UNMAP_VIEW_OF_SECTION,
+        &[process_handle as usize, base_address as usize],
+    )
+}
+
+// ============================================================================
+// Utility functions
+// ============================================================================
+
+/// Get current process pseudo-handle (-1)
+#[inline]
+pub fn current_process() -> HANDLE {
+    -1isize as HANDLE
+}
+
+/// Get current thread pseudo-handle (-2)
+#[inline]
+pub fn current_thread() -> HANDLE {
+    -2isize as HANDLE
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn test_ssn_resolution() {
+    fn test_hash_computation() {
+        // Verify DJB2 hash for NtClose
+        let hash = djb2_hash(b"NtClose");
+        assert_eq!(hash, hashes::NT_CLOSE);
+    }
+
+    #[test]
+    fn test_syscall_table_init() {
         unsafe {
-            // NtClose typically has a low SSN (around 0x0F)
-            let ssn = resolve_ssn("NtClose");
-            assert!(ssn.is_ok());
-            assert!(ssn.unwrap() < 0x200); // SSNs are typically < 512
+            let result = init_syscalls();
+            assert!(result.is_ok());
+
+            let table = get_table();
+            assert!(table.is_ok());
+
+            // Verify we found syscall gadgets
+            let t = table.unwrap();
+            assert!(!t.syscall_gadgets.is_empty());
         }
     }
 }
