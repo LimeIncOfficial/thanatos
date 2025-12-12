@@ -2,9 +2,35 @@
 dep-info-basedir = "."
 incremental = true
 
+# PIC (Position-Independent Code) configuration for reflective loading
+# Enables seamless memory relocation without fixed base addresses
 [target.x86_64-pc-windows-gnu]
 linker = "x86_64-w64-mingw32-gcc"
+rustflags = [
+    "-C", "relocation-model=pic",      # Position-independent code
+    "-C", "panic=abort",                # No unwinding (smaller binary)
+    "-C", "link-arg=-nostartfiles",     # No standard startup files
+    "-C", "link-arg=-Wl,--dynamicbase", # ASLR compatible
+    "-C", "link-arg=-Wl,--no-seh",      # No SEH (cleaner shellcode)
+]
 
 [target.i686-pc-windows-gnu]
 linker = "i686-w64-mingw32-gcc"
-rustflags = "-C panic=abort"
+rustflags = [
+    "-C", "relocation-model=pic",
+    "-C", "panic=abort",
+    "-C", "link-arg=-nostartfiles",
+    "-C", "link-arg=-Wl,--dynamicbase",
+]
+
+[target.x86_64-pc-windows-msvc]
+rustflags = [
+    "-C", "relocation-model=pic",
+    "-C", "panic=abort",
+]
+
+[target.x86_64-unknown-linux-gnu]
+rustflags = [
+    "-C", "relocation-model=pic",
+    "-C", "panic=abort",
+]

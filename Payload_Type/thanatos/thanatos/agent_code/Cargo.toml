@@ -8,8 +8,18 @@ authors = ["Matt Ehrnschwender (@M_alphaaa)"]
 edition = "2021"
 
 
+# Release profile optimized for PIC/reflective loading
 [profile.release]
-strip = "symbols"
+opt-level = "z"       # Optimize for size (better for shellcode)
+lto = true            # Link-time optimization (smaller binary)
+codegen-units = 1     # Single codegen unit (better optimization)
+panic = "abort"       # No unwinding (smaller, cleaner)
+strip = "symbols"     # Strip debug symbols
+
+# Dev profile for faster builds during development
+[profile.dev]
+opt-level = 0
+debug = true
 
 [dependencies]
 aes = "0.7.5"
