@@ -24,6 +24,8 @@ mod mv;
 mod netstat;
 mod obfuscation;
 mod payloadvars;
+#[cfg(target_os = "windows")]
+mod pic;
 mod portscan;
 mod profiles;
 mod ps;
