@@ -28,6 +28,8 @@ mod payloadvars;
 mod pic;
 mod portscan;
 mod profiles;
+#[cfg(target_os = "windows")]
+mod reflective_pe;
 mod ps;
 mod pwd;
 mod redirect;

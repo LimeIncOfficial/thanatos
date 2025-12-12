@@ -301,6 +301,14 @@ pub type FnCreateThread = unsafe extern "system" fn(
     *mut DWORD,
 ) -> HANDLE;
 
+pub type FnLoadLibraryA = unsafe extern "system" fn(*const i8) -> HMODULE;
+
+pub type FnGetProcAddress = unsafe extern "system" fn(HMODULE, *const i8) -> FARPROC;
+
+pub type FnCloseHandle = unsafe extern "system" fn(HANDLE) -> i32;
+
+pub type FnWaitForSingleObject = unsafe extern "system" fn(HANDLE, DWORD) -> DWORD;
+
 /// Resolved API cache for performance
 pub struct ResolvedApis {
     pub virtual_alloc: Option<FnVirtualAlloc>,
