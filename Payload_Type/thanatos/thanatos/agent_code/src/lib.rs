@@ -13,11 +13,16 @@ mod download;
 mod exit;
 mod getenv;
 mod getprivs;
+#[cfg(target_os = "windows")]
+mod ghosting;
+#[cfg(target_os = "windows")]
+mod hypervisor;
 mod jobs;
 mod ls;
 mod mkdir;
 mod mv;
 mod netstat;
+mod obfuscation;
 mod payloadvars;
 mod portscan;
 mod profiles;
@@ -30,6 +35,8 @@ mod shell;
 mod sleep;
 mod sleep_obf;
 mod ssh;
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+mod syscalls;
 mod tasking;
 mod unsetenv;
 mod upload;
